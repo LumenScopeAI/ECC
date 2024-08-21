@@ -298,6 +298,10 @@ def bit_flip(x, err_rate, err_type):
         
         # 重塑回原始形状并移除填充
         x = result.view(-1)[:original_numel].view(original_shape)
+        # 模拟Value-aware Parity Insertion ECC的行为
+        threshold = 128  # 对应于0.5，因为我们使用的是uint8类型
+        mask = x >= threshold
+        x[mask] = x[mask] & 0xFC  # 将最低两位置为0（0xFC = 11111100
     else:
         raise ValueError("Invalid err_type. Must be 0-19.")
     
