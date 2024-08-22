@@ -60,8 +60,10 @@ import torch
 import random
 
 class GPUMemoryErrorSimulator:
-    def __init__(self, device='cuda'):
+    def __init__(self, device='cuda', error_probability=0.01, use_ecc=True):
         self.device = device
+        self.error_probability = error_probability
+        self.use_ecc = use_ecc
         self.error_rates = {
             'SBSE': 0.7398,
             'Pin': 0.0019,
@@ -73,6 +75,8 @@ class GPUMemoryErrorSimulator:
         }
 
     def hamming_encode(self, data):
+        if not self.use_ecc:
+            return torch.zeros_like(data[:, :, 0])
         device = data.device
         encoded = torch.zeros((*data.shape[:-1], 8), dtype=torch.uint8, device=device)
         
@@ -85,6 +89,8 @@ class GPUMemoryErrorSimulator:
         return encoded
 
     def hamming_decode_and_correct(self, data, ecc):
+        if not self.use_ecc:
+            return data, 0
         device = data.device
         syndrome = (
             (data[..., 0] ^ data[..., 1] ^ data[..., 3] ^ data[..., 4] ^ data[..., 6] ^ ((ecc & 1) != 0)) |
@@ -109,9 +115,10 @@ class GPUMemoryErrorSimulator:
         ecc_data = self.hamming_encode(organized_data)
         
         # 将数据和ECC组合
-        combined_data = torch.zeros((organized_data.shape[0], 4, 9), dtype=torch.uint8, device=self.device)
+        combined_data = torch.zeros((organized_data.shape[0], 4, 9 if self.use_ecc else 8), dtype=torch.uint8, device=self.device)
         combined_data[..., :8] = organized_data
-        combined_data[..., 8] = ecc_data
+        if self.use_ecc:
+            combined_data[..., 8] = ecc_data
         
         return combined_data
 
@@ -120,7 +127,7 @@ class GPUMemoryErrorSimulator:
         data = data.clone()
         
         for entry in range(data.shape[0]):
-            if random.random() < sum(self.error_rates.values()):
+            if random.random() < self.error_probability:
                 error_type = random.choices(list(self.error_rates.keys()), 
                                             weights=list(self.error_rates.values()))[0]
                 self._inject_error(data[entry], error_type)
@@ -146,14 +153,14 @@ class GPUMemoryErrorSimulator:
 
     def _flip_single_bit(self, entry):
         codeword = random.randint(0, 3)
-        bit = random.randint(0, 8)
+        bit = random.randint(0, 8 if self.use_ecc else 7)
         entry[codeword, bit] ^= 1
 
     def _flip_pin(self, entry):
         codeword = random.randint(0, 3)
         start_bit = random.randint(0, 5)
         num_bits = random.randint(2, 4)
-        for bit in range(start_bit, min(start_bit + num_bits, 9)):
+        for bit in range(start_bit, min(start_bit + num_bits, 9 if self.use_ecc else 8)):
             entry[codeword, bit] ^= 1
 
     def _flip_byte(self, entry):
@@ -162,30 +169,32 @@ class GPUMemoryErrorSimulator:
 
     def _flip_two_bits(self, entry):
         codeword = random.randint(0, 3)
-        bits = random.sample(range(9), 2)
+        bits = random.sample(range(9 if self.use_ecc else 8), 2)
         for bit in bits:
             entry[codeword, bit] ^= 1
 
     def _flip_three_bits(self, entry):
         codeword = random.randint(0, 3)
-        bits = random.sample(range(9), 3)
+        bits = random.sample(range(9 if self.use_ecc else 8), 3)
         for bit in bits:
             entry[codeword, bit] ^= 1
 
     def _flip_beat(self, entry):
         codeword = random.randint(0, 3)
-        for bit in range(9):
+        for bit in range(9 if self.use_ecc else 8):
             if random.random() < 0.5:
                 entry[codeword, bit] ^= 1
 
     def _flip_entry(self, entry):
         for codeword in range(4):
-            for bit in range(9):
+            for bit in range(9 if self.use_ecc else 8):
                 if random.random() < 0.5:
                     entry[codeword, bit] ^= 1
 
     def simulate_read(self, data):
         """模拟读取过程"""
+        if not self.use_ecc:
+            return data.reshape(-1), 0
         corrected_data = torch.zeros((data.shape[0], 4, 8), dtype=torch.uint8, device=self.device)
         total_errors = 0
         for i in range(4):
@@ -198,6 +207,8 @@ class GPUMemoryErrorSimulator:
         """模拟写入过程"""
         N = data.numel() // 32
         reshaped_data = data.reshape(N, 4, 8)
+        if not self.use_ecc:
+            return reshaped_data
         ecc_data = self.hamming_encode(reshaped_data)
         combined_data = torch.zeros((N, 4, 9), dtype=torch.uint8, device=self.device)
         combined_data[..., :8] = reshaped_data
