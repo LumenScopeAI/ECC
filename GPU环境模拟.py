@@ -1,4 +1,5 @@
 import torch
+import math
 
 def unpackbits(x):
     return torch.stack([x.byte() >> i & 1 for i in range(8)], dim=-1).bool()
@@ -39,30 +40,45 @@ class Channel:
 class HBM2Stack:
     def __init__(self, num_channels=8):
         self.channels = [Channel() for _ in range(num_channels)]
+        self.original_size = 0
 
     def write(self, channel, pseudo_channel, bank, subarray, mat, address, data):
-        if data.numel() != 36:  # 32B data + 4B ECC
-            raise ValueError("Data must be 36 bytes (32B data + 4B ECC)")
+        self.original_size = data.size(0)  # Store the original size
+        # Pad data to multiple of 32 bytes
+        pad_size = (32 - data.size(-1) % 32) % 32
+        padded_data = torch.nn.functional.pad(data, (0, pad_size))
         
-        interleaved_data = self.interleave_data(data)
-        ecc_encoded_data = self.ecc_encode(interleaved_data)  # ECC encoding interface
+        # Reshape to (A, 32)
+        reshaped_data = padded_data.view(-1, 32)
+        
+        ecc_encoded_data = self.ecc_encode(reshaped_data)  # ECC encoding interface
+        interleaved_data = self.interleave_data(ecc_encoded_data)
         
         target_mat = self.channels[channel].pseudo_channels[pseudo_channel].banks[bank].subarrays[subarray].mats[mat]
         if target_mat.data is None:
             target_mat.initialize()
-        target_mat.data[address:address+36] = ecc_encoded_data
+        
+        # Write all groups
+        target_mat.data[address:address+interleaved_data.numel()] = interleaved_data.view(-1)
 
-    def read(self, channel, pseudo_channel, bank, subarray, mat, address):
+    def read(self, channel, pseudo_channel, bank, subarray, mat, address, num_groups):
         target_mat = self.channels[channel].pseudo_channels[pseudo_channel].banks[bank].subarrays[subarray].mats[mat]
         if target_mat.data is None:
             target_mat.initialize()
         
-        ecc_encoded_data = target_mat.data[address:address+36]
-        interleaved_data = self.ecc_decode(ecc_encoded_data)  # ECC decoding interface
-        return self.deinterleave_data(interleaved_data)
+        interleaved_data = target_mat.data[address:address+num_groups*36].view(num_groups, 36)
+        ecc_encoded_data = self.deinterleave_data(interleaved_data)
+        return self.ecc_decode(ecc_encoded_data)  # ECC decoding interface
 
     def interleave_data(self, data):
-        bits = unpackbits(data).view(-1)
+        # Ensure data is 2D
+        if data.dim() == 1:
+            data = data.unsqueeze(0)
+        # Interleave each group independently
+        return torch.stack([self._interleave_group(group) for group in data])
+
+    def _interleave_group(self, group):
+        bits = unpackbits(group).view(-1)
         interleaved_bits = torch.zeros_like(bits)
         for i in range(288):
             new_index = (i * 73) % 288
@@ -70,7 +86,14 @@ class HBM2Stack:
         return packbits(interleaved_bits.view(-1, 8))
 
     def deinterleave_data(self, data):
-        bits = unpackbits(data).view(-1)
+        # Ensure data is 2D
+        if data.dim() == 1:
+            data = data.unsqueeze(0)
+        # Deinterleave each group independently
+        return torch.stack([self._deinterleave_group(group) for group in data])
+
+    def _deinterleave_group(self, group):
+        bits = unpackbits(group).view(-1)
         deinterleaved_bits = torch.zeros_like(bits)
         for i in range(288):
             original_index = (i * 73) % 288
@@ -78,42 +101,44 @@ class HBM2Stack:
         return packbits(deinterleaved_bits.view(-1, 8))
 
     def ecc_encode(self, data):
-        print('ecc_encode: ', data)
-        print("ecc_encode shape: ", data.shape)
-        # ECC encoding interface
-        # This function should implement the actual ECC encoding logic in the future
-        return data
+        # Simple ECC encoding: just add 4 bytes of zeros as a placeholder for each group
+        ecc = torch.zeros(data.size(0), 4, dtype=torch.uint8, device='cuda')
+        return torch.cat([data, ecc], dim=1)
 
     def ecc_decode(self, data):
-        print("ecc_decode: ", data)
-        print("ecc_decode shape: ", data.shape)
-        # ECC decoding interface
-        # This function should implement the actual ECC decoding and error correction logic in the future
-        return data
+        # Remove the last 4 bytes from each group
+        decoded_data = data[:, :32].reshape(-1)
+        # Remove any padding
+        return decoded_data[:self.original_size]
 
 def test_hbm2_structure():
     stack = HBM2Stack()
 
-    # Test write and read
-    test_data = torch.arange(36, dtype=torch.uint8, device='cuda')
-    print(f"Original test data: {test_data}")
-
-    print("Writing data...")
-    stack.write(0, 0, 0, 0, 0, 0, test_data)
-
-    print("Reading data...")
-    read_data = stack.read(0, 0, 0, 0, 0, 0)
-
-    print(f"Final read data: {read_data}")
+    # Test write and read with different input sizes
+    test_sizes = [32, 64, 100]  # Test with different input sizes
     
-    if torch.all(test_data.eq(read_data)):
-        print("Test passed: Read data matches written data")
-    else:
-        print("Test failed: Read data doesn't match written data")
-        print("Differences:")
-        for i in range(36):
-            if test_data[i] != read_data[i]:
-                print(f"Index {i}: Original {test_data[i]}, Read {read_data[i]}")
+    for size in test_sizes:
+        print(f"\nTesting with input size: {size}")
+        test_data = torch.arange(size, dtype=torch.uint8, device='cuda')
+        print(f"Original test data: {test_data}")
+
+        print("Writing data...")
+        stack.write(0, 0, 0, 0, 0, 0, test_data)
+
+        num_groups = math.ceil(size / 32)
+        print("Reading data...")
+        read_data = stack.read(0, 0, 0, 0, 0, 0, num_groups)
+
+        print(f"Final read data: {read_data}")
+        
+        if torch.all(test_data.eq(read_data)):
+            print("Test passed: Read data matches written data")
+        else:
+            print("Test failed: Read data doesn't match written data")
+            print("Differences:")
+            for i in range(size):
+                if test_data[i] != read_data[i]:
+                    print(f"Index {i}: Original {test_data[i]}, Read {read_data[i]}")
 
 # Run the test
 if torch.cuda.is_available():
