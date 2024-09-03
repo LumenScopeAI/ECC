@@ -1,155 +1,202 @@
 import torch
-import os
-import csv
 import matplotlib.pyplot as plt
+from collections import defaultdict
 import numpy as np
-from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
-from tqdm import tqdm
 
-# 创建结果目录
-result_dir = '/root/autodl-tmp/ECC_LLM/result'
-os.makedirs(result_dir, exist_ok=True)
-csv_file_front_two = os.path.join(result_dir, 'Qwen2-0.5B-Instruct_front_two_bits_distribution.csv')
-csv_file_composed_byte = os.path.join(result_dir, 'Qwen2-0.5B-Instruct_composed_byte_distribution.csv')
-png_file_front_two = os.path.join(result_dir, 'Qwen2-0.5B-Instruct_front_two_bits_distribution.png')
-png_file_composed_byte = os.path.join(result_dir, 'Qwen2-0.5B-Instruct_composed_byte_distribution.png')
-png_file_consecutive_zeros = os.path.join(result_dir, 'Qwen2-0.5B-Instruct_consecutive_zeros_distribution.png')
+# 全局变量用于记录统计信息
+stats = defaultdict(list)
 
-# 清空CSV文件
-open(csv_file_front_two, 'w').close()
-open(csv_file_composed_byte, 'w').close()
+@torch.no_grad()
+def exp(quantized_tensor, bytes_per_group=8, bits_per_unit=4):
+    # 将张量转换为浮点类型，并确保在正确的设备上
+    float_tensor = quantized_tensor.float()
+    device = float_tensor.device
 
-# 更新 CSV header
-csv_header = ['Value', 'Percentage']
-
-# 打开CSV文件并写入header
-for file in [csv_file_front_two, csv_file_composed_byte]:
-    with open(file, 'w', newline='') as f:
-        writer = csv.writer(f)
-        writer.writerow(csv_header)
-
-def flip_front_two_bits(byte):
-    front_two = byte >> 6
-    if front_two == 0b01:
-        return (byte & 0b00111111) | 0b00000000
-    elif front_two == 0b00:
-        return (byte & 0b00111111) | 0b01000000
-    return byte
-
-def analyze_param_distribution(model):
-    front_two_distribution = np.zeros(4, dtype=np.int64)
-    composed_byte_distribution = np.zeros(256, dtype=np.int64)
-    consecutive_zeros_count = np.zeros(7, dtype=np.int64)
-    total_bytes = 0
-    composed_bytes = []
+    # 计算基本统计信息
+    mean = torch.mean(float_tensor).item()
+    std = torch.std(float_tensor).item()
+    min_val = torch.min(float_tensor).item()
+    max_val = torch.max(float_tensor).item()
     
-    with torch.no_grad():
-        for name, param in tqdm(model.named_parameters(), desc="Analyzing parameters"):
-            if param.dtype == torch.int8:
-                # 将参数转换为numpy数组
-                uint8_param = param.byte().cpu().numpy().flatten()
-                
-                # +96取模
-                uint8_param_plus96 = (uint8_param + 96) % 256
-                
-                # 交换特定前两位
-                uint8_param_flipped = np.vectorize(flip_front_two_bits)(uint8_param_plus96)
-                
-                # 确保结果在0-255范围内
-                uint8_param_final = uint8_param_flipped.astype(np.uint8)
-                
-                # 统计前两位的分布
-                front_two_bits = uint8_param_final >> 6
-                unique, counts = np.unique(front_two_bits, return_counts=True)
-                for value, count in zip(unique, counts):
-                    front_two_distribution[value] += count
-                
-                # 每8个字节组成一个新的字节
-                for i in range(0, len(uint8_param_final), 8):
-                    chunk = uint8_param_final[i:i+8]
-                    if len(chunk) == 8:
-                        composed_byte = sum((b >> 6) << (2 * (7-j)) for j, b in enumerate(chunk))
-                        composed_bytes.append(composed_byte)
-                
-                total_bytes += uint8_param_final.size
+    # 计算分位数，确保 quantiles 在正确的设备上
+    quantiles = torch.tensor([0.25, 0.5, 0.75], device=device)
+    q1, median, q3 = torch.quantile(float_tensor, quantiles).tolist()
     
-    # 统计组合后字节的分布
-    composed_bytes = np.array(composed_bytes, dtype=np.uint8)
-    unique, counts = np.unique(composed_bytes, return_counts=True)
-    for value, count in zip(unique, counts):
-        composed_byte_distribution[value] += count
+    # 计算直方图
+    hist = torch.histogram(float_tensor.cpu(), bins=10)  # 将张量移到 CPU 上计算直方图
     
-    # 统计连续零的概率
-    for i in range(7):
-        mask = 0b11 << (2*i)
-        consecutive_zeros_count[i] = np.sum((composed_bytes & mask) == 0)
+    # 记录统计信息
+    stats['mean'].append(mean)
+    stats['std'].append(std)
+    stats['min'].append(min_val)
+    stats['max'].append(max_val)
+    stats['median'].append(median)
+    stats['q1'].append(q1)
+    stats['q3'].append(q3)
+    stats['hist_bins'].append(hist.bin_edges.tolist())
+    stats['hist_counts'].append(hist.hist.tolist())
     
-    # 计算百分比
-    front_two_percentage = (front_two_distribution / total_bytes) * 100
-    composed_byte_percentage = (composed_byte_distribution / len(composed_bytes)) * 100
-    consecutive_zeros_percentage = (consecutive_zeros_count / len(composed_bytes)) * 100
+    return quantized_tensor  # 返回原始的量化张量
+
+
+# 在程序末尾添加以下代码来绘制图表
+def plot_distribution():
+    fig, axs = plt.subplots(2, 2, figsize=(15, 15))
     
-    return front_two_percentage, composed_byte_percentage, consecutive_zeros_percentage
+    # 绘制均值和标准差的变化
+    axs[0, 0].plot(stats['mean'], label='Mean')
+    axs[0, 0].plot(stats['std'], label='Std Dev')
+    axs[0, 0].set_title('Mean and Standard Deviation')
+    axs[0, 0].legend()
+    
+    # 绘制最小值、最大值和中位数的变化
+    axs[0, 1].plot(stats['min'], label='Min')
+    axs[0, 1].plot(stats['max'], label='Max')
+    axs[0, 1].plot(stats['median'], label='Median')
+    axs[0, 1].set_title('Min, Max, and Median')
+    axs[0, 1].legend()
+    
+    # 绘制四分位数的变化
+    axs[1, 0].plot(stats['q1'], label='Q1')
+    axs[1, 0].plot(stats['median'], label='Median')
+    axs[1, 0].plot(stats['q3'], label='Q3')
+    axs[1, 0].set_title('Quartiles')
+    axs[1, 0].legend()
+    
+    # 绘制最后一次的直方图
+    if stats['hist_bins'] and stats['hist_counts']:
+        axs[1, 1].bar(stats['hist_bins'][-1][:-1], stats['hist_counts'][-1], 
+                      width=np.diff(stats['hist_bins'][-1]), align='edge')
+        axs[1, 1].set_title('Last Histogram')
+    
+    plt.tight_layout()
+    plt.savefig('quantized_tensor_distribution.png')
+    print("Distribution plot saved as 'quantized_tensor_distribution.png'")
 
-def plot_distribution(distribution, title, filename):
-    plt.figure(figsize=(12, 6))
-    plt.bar(range(len(distribution)), distribution)
-    plt.title(title)
-    plt.xlabel('Value')
-    plt.ylabel('Percentage')
-    plt.savefig(filename)
-    plt.close()
 
-def plot_consecutive_zeros(consecutive_zeros_percentage, filename):
-    plt.figure(figsize=(10, 6))
-    plt.bar(range(1, 8), consecutive_zeros_percentage)
-    plt.title('Probability of Consecutive Zeros in Composed Bytes')
-    plt.xlabel('Position of Consecutive Zeros')
-    plt.ylabel('Percentage')
-    plt.xticks(range(1, 8), ['1-2', '2-3', '3-4', '4-5', '5-6', '6-7', '7-8'])
-    plt.savefig(filename)
-    plt.close()
+@torch.no_grad()
+def pseudo_quantize_tensor(tensor, n_bits=8, zero_point=True, q_group_size=-1, per_tensor=False, inplace=False):
+    device = tensor.device
+    org_tensor_shape = tensor.shape
+    if q_group_size > 0:
+        assert org_tensor_shape[-1] % q_group_size == 0
+        tensor = tensor.reshape(-1, q_group_size)
+    if per_tensor:
+        tensor = tensor.reshape(1, -1)
+    assert tensor.dim() == 2
+    if zero_point:
+        max_val = tensor.amax(dim=1, keepdim=True)
+        min_val = tensor.amin(dim=1, keepdim=True)
+        max_int = 2**n_bits - 1
+        min_int = 0
+        scales = (max_val - min_val).clamp(min=1e-5) / max_int
+        zeros = (-torch.round(min_val / scales)).clamp_(min_int, max_int)
+    else:
+        max_val = tensor.abs().amax(dim=1, keepdim=True)
+        max_val = max_val.clamp(min=1e-5)
+        max_int = 2 ** (n_bits - 1) - 1
+        min_int = -(2 ** (n_bits - 1))
+        scales = max_val / max_int
+        zeros = torch.zeros_like(scales, device=device)
 
-def save_distribution_to_csv(distribution, filename):
-    with open(filename, 'a', newline='') as f:
-        writer = csv.writer(f)
-        for value, percentage in enumerate(distribution):
-            if percentage > 0:  # 只保存非零值
-                writer.writerow([value, f"{percentage:.6f}"])
+    # 量化过程开始
+    if inplace:
+        quantized_tensor = tensor.div_(scales).round_().add_(zeros).clamp_(min_int, max_int)
+    else:
+        quantized_tensor = torch.clamp(torch.round(tensor / scales) + zeros, min_int, max_int)
 
-# 主程序
-if __name__ == "__main__":
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    bnb_config = BitsAndBytesConfig(load_in_8bit=True)
+    # 注释：这里是量化和反量化的分界处
+    quantized_tensor = exp(quantized_tensor)
 
-    print("Loading model...")
-    model = AutoModelForCausalLM.from_pretrained("/root/autodl-tmp/ECC_LLM/models/Qwen2-0.5B-Instruct", 
-                                                 quantization_config=bnb_config, 
-                                                 device_map="auto", 
-                                                 trust_remote_code=True)
+    # 反量化过程开始
+    if inplace:
+        dequantized_tensor = quantized_tensor.sub_(zeros).mul_(scales)
+    else:
+        dequantized_tensor = (quantized_tensor - zeros) * scales
 
-    print("Analyzing parameter distribution...")
-    front_two_percentage, composed_byte_percentage, consecutive_zeros_percentage = analyze_param_distribution(model)
+    assert torch.isnan(dequantized_tensor).sum() == 0
 
-    print("Saving results...")
-    save_distribution_to_csv(front_two_percentage, csv_file_front_two)
-    save_distribution_to_csv(composed_byte_percentage, csv_file_composed_byte)
-    plot_distribution(front_two_percentage, 'Distribution of Front Two Bits', png_file_front_two)
-    plot_distribution(composed_byte_percentage, 'Distribution of Composed Bytes', png_file_composed_byte)
-    plot_consecutive_zeros(consecutive_zeros_percentage, png_file_consecutive_zeros)
+    dequantized_tensor = dequantized_tensor.reshape(org_tensor_shape)
 
-    print("\nFront Two Bits Distribution:")
-    for i, percentage in enumerate(front_two_percentage):
-        print(f"Bits {i:02b}: {percentage:.2f}%")
+    return dequantized_tensor
 
-    print("\nConsecutive Zeros Probabilities in Composed Bytes:")
-    for i, percentage in enumerate(consecutive_zeros_percentage):
-        print(f"Bits {i+1}-{i+2}: {percentage:.2f}%")
+@torch.no_grad()
+def quantize_weight_per_channel_absmax(w, n_bits=8):
+    """
+    The basic quantization function for weight, activation and KV cache.
+    """
+    tensor = pseudo_quantize_tensor(w, n_bits=n_bits, zero_point=False, q_group_size=-1, per_tensor=False, inplace=False)
+    return tensor
+    
+@torch.no_grad()
+def quantize_activation_per_token_absmax(t, n_bits=8):
+    t_shape = t.shape
+    t = t.reshape(-1, t_shape[-1])
+    t = pseudo_quantize_tensor(t, n_bits=n_bits, zero_point=True, q_group_size=-1, per_tensor=True, inplace=False)
+    return t.reshape(t_shape)
+    
+@torch.no_grad()
+def quantize_weight_per_tensor_absmax(w, n_bits=8):
+    """
+    The basic quantization function for weight, activation and KV cache.
+    """
+    tensor = pseudo_quantize_tensor(w, n_bits=n_bits, zero_point=False, q_group_size=-1, per_tensor=True, inplace=False)
+    return tensor
+    
+@torch.no_grad()
+def quantize_activation_per_tensor_absmax(t, n_bits=8):
+    t_shape = t.shape
+    t = t.reshape(-1, t_shape[-1])
+    t = pseudo_quantize_tensor(t, n_bits=n_bits, zero_point=True, q_group_size=-1, per_tensor=True, inplace=False)
+    return t.reshape(t_shape)
 
-    print("\nExperiment completed. Results saved to:")
-    print(f"CSV files: {csv_file_front_two}, {csv_file_composed_byte}")
-    print(f"PNG files: {png_file_front_two}, {png_file_composed_byte}, {png_file_consecutive_zeros}")
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
-    # 清理内存
-    del model
-    torch.cuda.empty_cache()
+model_path = "/media/tangshi/AI001/models/Llama-2-7b-hf"
+
+model = AutoModelForCausalLM.from_pretrained(
+    model_path,
+    torch_dtype=torch.float16,
+    device_map='cuda:0'
+)
+model.config.use_cache = True
+
+tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+tokenizer.pad_token = tokenizer.eos_token
+tokenizer.padding_side = "right"
+
+def process_kv_cache(key_cache, value_cache):
+    # 对 key_cache 进行量化
+    processed_key_cache = [quantize_activation_per_token_absmax(k) for k in key_cache]
+    
+    # 对 value_cache 进行量化
+    processed_value_cache = [quantize_activation_per_token_absmax(v) for v in value_cache]
+    return processed_key_cache, processed_value_cache
+
+def kv_cache_hook(module, input, output):
+    _, _, cache = output
+    key_cache = cache.key_cache
+    value_cache = cache.value_cache
+    
+    processed_key_cache, processed_value_cache = process_kv_cache(key_cache, value_cache)
+    
+    cache.key_cache = processed_key_cache
+    cache.value_cache = processed_value_cache
+    
+    return output
+
+for layer in model.model.layers:
+    layer.self_attn.register_forward_hook(kv_cache_hook)
+
+input_text = "Hello, how are you?"
+input_ids = tokenizer(input_text, return_tensors="pt").input_ids.to(model.device)
+
+with torch.no_grad():
+    output = model.generate(input_ids, max_length=50)
+
+decoded_output = tokenizer.decode(output[0], skip_special_tokens=True)
+print("\nGenerated output:")
+print(decoded_output)
+# 在程序结束时绘制图表
+plot_distribution()
