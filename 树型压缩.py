@@ -1,13 +1,11 @@
 import torch
-import matplotlib.pyplot as plt
-import numpy as np
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
 # ===========================全局变量===========================
 compresser_type = 'Tree'
-bytes_per_group = 64
-bits_per_unit = 4
+bytes_per_group = 8
+bits_per_unit = 8
 # 全局变量来记录压缩比
 compression_ratio = 0
 
@@ -19,9 +17,9 @@ model_path = "/media/tangshi/AI001/models/Llama-2-7b-hf"
 # ===========================树型压缩===========================
 
 @torch.no_grad()
-def Tree(org_tensor, bytes_per_group=8, bits_per_unit=4):
+def Tree(org_tensor, bytes_per_group, bits_per_unit):
     global compression_ratio
-    def tree_compress(org_tensor, bytes_per_group=64, bits_per_unit=4):
+    def tree_compress(org_tensor, bytes_per_group, bits_per_unit):
         device = org_tensor.device
         
         # Step 1: Flatten the tensor
@@ -54,7 +52,7 @@ def Tree(org_tensor, bytes_per_group=8, bits_per_unit=4):
         compressed_tensor = torch.tensor(compressed, dtype=torch.uint8, device=device)
         return compressed_tensor, pad_size
 
-    def tree_decompress(compressed_tensor, original_shape, bytes_per_group=64, bits_per_unit=4, pad_size=0):
+    def tree_decompress(compressed_tensor, original_shape, bytes_per_group, bits_per_unit, pad_size=0):
         device = compressed_tensor.device
         compressed = compressed_tensor.tolist()
         
@@ -176,7 +174,7 @@ def compress(quantized_tensor):
     # 在这里选择不同的压缩、还原、错误注入
     global compresser_type, bytes_per_group, bits_per_unit
     if compresser_type == 'Tree':
-        Tree(result_2bit, bytes_per_group=8, bits_per_unit=4)
+        Tree(result_2bit, bytes_per_group=bytes_per_group, bits_per_unit=bits_per_unit)
     
     # 步骤3：恢复张量
     recovered_tensor = recover_tensor(result_2bit, result_6bit)
