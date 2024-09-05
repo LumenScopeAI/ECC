@@ -1,176 +1,393 @@
 import torch
-import random
-import math
+import matplotlib.pyplot as plt
+import numpy as np
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
-def generate_sparse_tensor(size, bits_per_unit):
+
+# ===========================全局变量===========================
+compresser_type = 'Tree'
+bytes_per_group = 64
+bits_per_unit = 4
+# 全局变量来记录压缩比
+compression_ratio = 0
+
+# 全局变量来记录kvcache历史长度
+global_kv_cache_length = 0
+
+model_path = "/media/tangshi/AI001/models/Llama-2-7b-hf"
+
+# ===========================树型压缩===========================
+
+@torch.no_grad()
+def Tree(org_tensor, bytes_per_group=8, bits_per_unit=4):
+    global compression_ratio
+    def tree_compress(org_tensor, bytes_per_group=64, bits_per_unit=4):
+        device = org_tensor.device
+        
+        # Step 1: Flatten the tensor
+        flattened = org_tensor.reshape(-1)
+        
+        # Pad the flattened tensor to make its length divisible by bytes_per_group
+        pad_size = (bytes_per_group - flattened.size(0) % bytes_per_group) % bytes_per_group
+        if pad_size > 0:
+            flattened = torch.cat([flattened, torch.zeros(pad_size, dtype=torch.uint8, device=device)])
+        
+        # Step 2: Compress using tree algorithm
+        compressed = []
+        for i in range(0, flattened.size(0), bytes_per_group):
+            group = flattened[i:i+bytes_per_group]
+            if torch.all(group == 0):
+                compressed.append(0)
+            else:
+                compressed.append(1)
+                for byte in group:
+                    byte_bits = [int(b) for b in f'{byte.item():08b}']
+                    for j in range(0, 8, bits_per_unit):
+                        bits = byte_bits[j:j+bits_per_unit]
+                        if all(bit == 0 for bit in bits):
+                            compressed.append(0)
+                        else:
+                            compressed.append(1)
+                            compressed.extend(bits)
+        
+        # Convert compressed to tensor
+        compressed_tensor = torch.tensor(compressed, dtype=torch.uint8, device=device)
+        return compressed_tensor, pad_size
+
+    def tree_decompress(compressed_tensor, original_shape, bytes_per_group=64, bits_per_unit=4, pad_size=0):
+        device = compressed_tensor.device
+        compressed = compressed_tensor.tolist()
+        
+        # Step 4: Decompress
+        decompressed = []
+        i = 0
+        while i < len(compressed):
+            if compressed[i] == 0:
+                decompressed.extend([0] * bytes_per_group)
+                i += 1
+            else:
+                group = [0] * bytes_per_group
+                i += 1
+                for byte_idx in range(bytes_per_group):
+                    byte = 0
+                    for j in range(0, 8, bits_per_unit):
+                        if compressed[i] == 0:
+                            i += 1
+                        else:
+                            i += 1
+                            for k in range(bits_per_unit):
+                                if i + k < len(compressed):
+                                    byte |= compressed[i+k] << (7 - j - k)
+                            i += bits_per_unit
+                    group[byte_idx] = byte
+                decompressed.extend(group)
+        
+        # Remove padding
+        decompressed = decompressed[:-pad_size] if pad_size > 0 else decompressed
+        
+        # Reshape decompressed to match original shape
+        decompressed_tensor = torch.tensor(decompressed, dtype=torch.uint8, device=device).reshape(original_shape)
+        
+        return decompressed_tensor
+
+    compressed_tensor, pad_size = tree_compress(org_tensor, bytes_per_group=bytes_per_group, bits_per_unit=bits_per_unit)
+    decompressed_tensor = tree_decompress(compressed_tensor, org_tensor.shape, bytes_per_group=bytes_per_group, bits_per_unit=bits_per_unit, pad_size=pad_size)
+    
+    # Calculate compression ratio
+    original_size = org_tensor.numel() * org_tensor.element_size()
+    compressed_size = compressed_tensor.numel() * compressed_tensor.element_size()
+    compression_ratio = compressed_size / original_size
+    # Verify decompression using assert
+    assert torch.all(org_tensor == decompressed_tensor), "Decompression failed: mismatch with original data"
+
+    return decompressed_tensor
+
+
+# ===========================特殊编码===========================
+
+@torch.no_grad()
+def group_and_pad(quantized_tensor):
+    # 将输入张量展平
+    flat_tensor = quantized_tensor.view(-1)
+    
+    # 计算需要填充的数量
+    pad_size = (64 - (flat_tensor.size(0) % 64)) % 64
+    
+    # 填充张量
+    padded_tensor = torch.nn.functional.pad(flat_tensor, (0, pad_size), mode='constant', value=0)
+    
+    # 重塑张量为 [..., 64]
+    grouped_tensor = padded_tensor.view(-1, 64)
+    
+    return grouped_tensor, pad_size
+
+@torch.no_grad()
+def process_tensor(input_tensor):
+    assert input_tensor.shape[1] == 64, "Input tensor must have 64 bytes in the last dimension"
+    
+    # 提取前2位和后6位
+    two_bit = (input_tensor >> 6) & 0b11
+    six_bit = input_tensor & 0b00111111
+    
+    # 重塑张量以便进行位操作
+    two_bit = two_bit.view(input_tensor.shape[0], 16, 4)
+    six_bit = six_bit.view(input_tensor.shape[0], 16, 4)
+    
+    # 计算result_2bit
+    result_2bit = (two_bit[:, :, 0] << 6) | (two_bit[:, :, 1] << 4) | (two_bit[:, :, 2] << 2) | two_bit[:, :, 3]
+    
+    # 计算result_6bit
+    result_6bit = torch.zeros((input_tensor.shape[0], 48), dtype=torch.uint8, device=input_tensor.device)
+    result_6bit[:, 0::3] = (six_bit[:, :, 0] << 2) | (six_bit[:, :, 1] >> 4)
+    result_6bit[:, 1::3] = ((six_bit[:, :, 1] & 0b1111) << 4) | (six_bit[:, :, 2] >> 2)
+    result_6bit[:, 2::3] = ((six_bit[:, :, 2] & 0b11) << 6) | six_bit[:, :, 3]
+    
+    return result_2bit, result_6bit
+
+@torch.no_grad()
+def recover_tensor(result_2bit, result_6bit):
+    assert result_2bit.shape[1] == 16 and result_6bit.shape[1] == 48, "Input tensors must have correct shapes"
+    
+    recovered_tensor = torch.zeros((result_2bit.shape[0], 64), dtype=torch.uint8, device=result_2bit.device)
+    
+    # 恢复前2位
+    for i in range(4):
+        recovered_tensor[:, i::4] |= ((result_2bit >> (6 - i*2)) & 0b11) << 6
+    
+    # 恢复后6位
+    recovered_tensor[:, 0::4] |= (result_6bit[:, 0::3] >> 2) & 0b00111111
+    recovered_tensor[:, 1::4] |= ((result_6bit[:, 0::3] & 0b11) << 4) | (result_6bit[:, 1::3] >> 4) & 0b00001111
+    recovered_tensor[:, 2::4] |= ((result_6bit[:, 1::3] & 0b1111) << 2) | (result_6bit[:, 2::3] >> 6) & 0b00000011
+    recovered_tensor[:, 3::4] |= result_6bit[:, 2::3] & 0b00111111
+    
+    return recovered_tensor
+
+@torch.no_grad()
+def compress(quantized_tensor):
+    # 保存原始形状
+    original_shape = quantized_tensor.shape
+    
+    # 步骤1：分组和填充
+    grouped_tensor, pad_size = group_and_pad(quantized_tensor)
+    
+    # 步骤2：处理张量
+    result_2bit, result_6bit = process_tensor(grouped_tensor)
+    
+    # 在这里选择不同的压缩、还原、错误注入
+    global compresser_type, bytes_per_group, bits_per_unit
+    if compresser_type == 'Tree':
+        Tree(result_2bit, bytes_per_group=8, bits_per_unit=4)
+    
+    # 步骤3：恢复张量
+    recovered_tensor = recover_tensor(result_2bit, result_6bit)
+    
+    # 移除填充并恢复原始形状
+    final_recovered_tensor = recovered_tensor.view(-1)[:-pad_size if pad_size > 0 else None].view(original_shape)
+    
+    # 断言检查恢复是否正确
+    assert torch.all(quantized_tensor == final_recovered_tensor), "Recovery failed"
+    
+    return final_recovered_tensor
+
+@torch.no_grad()
+def int16_to_uint8(tensor):
     """
-    生成具有指定分布的张量
-    
-    :param size: 张量大小（字节数）
-    :param bits_per_unit: 每个判断单位的位数
-    :return: 生成的张量
+    将 int16 张量转换为 uint8 张量。
+    注意：这个函数假设输入张量的值在 0 到 255 之间。
     """
-    total_bits = size * 8
-    total_units = total_bits // bits_per_unit
+    return tensor.to(torch.uint8)
 
-    # 根据 bits_per_unit 动态生成分布
-    max_value = 2**bits_per_unit
-    distribution = [0] * max_value
-    distribution[0] = int(0.69 * 10**9)  # 约69%的概率为0
-    remaining = 10**9 - distribution[0]
-    for i in range(1, max_value):
-        distribution[i] = remaining // (max_value - 1)
-
-    probabilities = [d / sum(distribution) for d in distribution]
-
-    units = random.choices(range(max_value), weights=probabilities, k=total_units)
-    
-    bytes_list = []
-    for i in range(0, len(units), 8 // bits_per_unit):
-        byte = 0
-        for j in range(8 // bits_per_unit):
-            if i + j < len(units):
-                byte |= units[i+j] << (8 - (j+1)*bits_per_unit)
-        bytes_list.append(byte)
-
-    return torch.tensor(bytes_list, dtype=torch.uint8)
-
-def byte_to_bits(byte):
-    """将一个字节转换为8位的二进制字符串表示"""
-    return format(byte, '08b')
-
-def bits_to_string(bits):
-    """将比特列表转换为字符串"""
-    return ''.join(map(str, bits))
-
-def print_binary(original, compressed, bytes_per_group):
-    """打印原始和压缩后的二进制表示"""
-    print(f"原始二进制表示（{bytes_per_group * 2}字节）:")
-    for i in range(bytes_per_group * 2):
-        print(byte_to_bits(original[i]), end=' ')
-        if i == bytes_per_group - 1:
-            print()
-    print("\n压缩后的二进制表示（两棵树）:")
-    
-    # 找到第一棵树的结束位置
-    first_tree_end = len(compressed) // 2
-    
-    # 打印第一棵树
-    first_tree = bits_to_string(compressed[:first_tree_end])
-    print(' '.join(first_tree[i:i+8] for i in range(0, len(first_tree), 8)))
-    
-    # 打印第二棵树
-    second_tree = bits_to_string(compressed[first_tree_end:])
-    print(' '.join(second_tree[i:i+8] for i in range(0, len(second_tree), 8)))
-
-def compress_unit(unit, bits_per_unit):
+@torch.no_grad()
+def uint8_to_int16(tensor):
     """
-    压缩一个单位。
-    
-    :param unit: 输入的单位（0到2^bits_per_unit-1之间的整数）
-    :param bits_per_unit: 每个判断单位的位数
-    :return: 压缩后的比特列表
+    将 uint8 张量转换为 int16 张量。
     """
-    if unit == 0:
-        return [0]
-    return [1] + [int(b) for b in format(unit, f'0{bits_per_unit}b')]
+    return tensor.to(torch.int16)
 
-def compress_group(group, bits_per_unit):
+@torch.no_grad()
+def exp(quantized_tensor):
+    # 确保张量在GPU上并转换为int16
+    # int16为了防止循环偏移溢出导致不循环
+    int16_tensor = quantized_tensor.to(torch.int16)
+    
+    # 应用固定偏移（-96，相当于将128偏移到32）
+    shifted_tensor = (int16_tensor - 96) % 256
+    
+    # 在这里加入后续实验
+    uint8_shifted_tensor = int16_to_uint8(shifted_tensor)
+    
+    uint8_shifted_tensor_exp = compress(uint8_shifted_tensor)
+    
+    int16_shifted_tensor = uint8_to_int16(uint8_shifted_tensor_exp)
+     
+    assert torch.all(shifted_tensor == int16_shifted_tensor), "压缩、解压错误"
+        
+    # 将数值偏移回原来的位置
+    unshifted_tensor = (shifted_tensor + 96) % 256
+    
+    # 将偏移回原位置的tensor转回fp16格式并返回
+    return unshifted_tensor.to(torch.float16)
+
+
+
+# ===========================基础量化===========================
+
+@torch.no_grad()
+def pseudo_quantize_tensor(tensor, n_bits=8, zero_point=True, q_group_size=-1, per_tensor=False, inplace=False):
+    device = tensor.device
+    org_tensor_shape = tensor.shape
+    if q_group_size > 0:
+        assert org_tensor_shape[-1] % q_group_size == 0
+        tensor = tensor.reshape(-1, q_group_size)
+    if per_tensor:
+        tensor = tensor.reshape(1, -1)
+    assert tensor.dim() == 2
+    if zero_point:
+        max_val = tensor.amax(dim=1, keepdim=True)
+        min_val = tensor.amin(dim=1, keepdim=True)
+        max_int = 2**n_bits - 1
+        min_int = 0
+        scales = (max_val - min_val).clamp(min=1e-5) / max_int
+        zeros = (-torch.round(min_val / scales)).clamp_(min_int, max_int)
+    else:
+        max_val = tensor.abs().amax(dim=1, keepdim=True)
+        max_val = max_val.clamp(min=1e-5)
+        max_int = 2 ** (n_bits - 1) - 1
+        min_int = -(2 ** (n_bits - 1))
+        scales = max_val / max_int
+        zeros = torch.zeros_like(scales, device=device)
+
+    # 量化过程开始
+    if inplace:
+        quantized_tensor = tensor.div_(scales).round_().add_(zeros).clamp_(min_int, max_int)
+    else:
+        quantized_tensor = torch.clamp(torch.round(tensor / scales) + zeros, min_int, max_int)
+
+    # 注释：这里是量化和反量化的分界处
+    quantized_tensor = exp(quantized_tensor)
+
+    # 反量化过程开始
+    if inplace:
+        dequantized_tensor = quantized_tensor.sub_(zeros).mul_(scales)
+    else:
+        dequantized_tensor = (quantized_tensor - zeros) * scales
+
+    assert torch.isnan(dequantized_tensor).sum() == 0
+
+    dequantized_tensor = dequantized_tensor.reshape(org_tensor_shape)
+
+    return dequantized_tensor
+
+@torch.no_grad()
+def quantize_weight_per_channel_absmax(w, n_bits=8):
     """
-    压缩一组字节，构建树形结构。
-    
-    :param group: 包含bytes_per_group个字节的列表
-    :param bits_per_unit: 每个判断单位的位数
-    :return: 压缩后的比特列表，表示树形结构
+    The basic quantization function for weight, activation and KV cache.
     """
-    result = []
-    for byte in group:
-        for i in range(8 // bits_per_unit - 1, -1, -1):
-            unit = (byte >> (i*bits_per_unit)) & ((1 << bits_per_unit) - 1)
-            result.extend(compress_unit(unit, bits_per_unit))
-    return result
-
-def compress_tensor(tensor, bytes_per_group, bits_per_unit):
+    tensor = pseudo_quantize_tensor(w, n_bits=n_bits, zero_point=False, q_group_size=-1, per_tensor=False, inplace=False)
+    return tensor
+    
+@torch.no_grad()
+def quantize_activation_per_token_absmax(t, n_bits=8):
+    t_shape = t.shape
+    t = t.reshape(-1, t_shape[-1])
+    t = pseudo_quantize_tensor(t, n_bits=n_bits, zero_point=True, q_group_size=-1, per_tensor=True, inplace=False)
+    return t.reshape(t_shape)
+    
+@torch.no_grad()
+def quantize_weight_per_tensor_absmax(w, n_bits=8):
     """
-    压缩整个张量，使用树形结构。
-    
-    :param tensor: 输入的PyTorch张量（dtype=torch.uint8）
-    :param bytes_per_group: 每组的字节数
-    :param bits_per_unit: 每个判断单位的位数
-    :return: 压缩后的张量和填充的字节数
+    The basic quantization function for weight, activation and KV cache.
     """
-    if tensor.dim() != 1:
-        tensor = tensor.flatten()
+    tensor = pseudo_quantize_tensor(w, n_bits=n_bits, zero_point=False, q_group_size=-1, per_tensor=True, inplace=False)
+    return tensor
     
-    data = tensor.tolist()
-    padding = (bytes_per_group - len(data) % bytes_per_group) % bytes_per_group
-    data.extend([0] * padding)
-    
-    compressed = []
-    for i in range(0, len(data), bytes_per_group):
-        group = data[i:i+bytes_per_group]
-        compressed.extend(compress_group(group, bits_per_unit))
-    
-    # 确保压缩后的比特数是8的倍数
-    if len(compressed) % 8 != 0:
-        compressed.extend([0] * (8 - len(compressed) % 8))
-    
-    byte_list = []
-    for i in range(0, len(compressed), 8):
-        byte = int(''.join(map(str, compressed[i:i+8])), 2)
-        byte_list.append(byte)
-    
-    compressed_tensor = torch.tensor(byte_list, dtype=torch.uint8)
-    
-    return compressed_tensor, padding, compressed
+@torch.no_grad()
+def quantize_activation_per_tensor_absmax(t, n_bits=8):
+    t_shape = t.shape
+    t = t.reshape(-1, t_shape[-1])
+    t = pseudo_quantize_tensor(t, n_bits=n_bits, zero_point=True, q_group_size=-1, per_tensor=True, inplace=False)
+    return t.reshape(t_shape)
 
-def run_experiment(original_tensor, bytes_per_group, bits_per_unit):
-    """
-    运行压缩实验
-    
-    :param original_tensor: 原始张量
-    :param bytes_per_group: 每组的字节数
-    :param bits_per_unit: 每个判断单位的位数
-    """
-    compressed_tensor, padding, compressed_bits = compress_tensor(original_tensor, bytes_per_group, bits_per_unit)
-    
-    original_size = len(original_tensor)
-    compressed_size = len(compressed_tensor)
-    compression_ratio = original_size / compressed_size
-    
-    print(f"参数设置：每组 {bytes_per_group} 字节，每单位 {bits_per_unit} 位")
-    print(f"原始张量大小: {original_size} 字节")
-    print(f"压缩后张量大小: {compressed_size} 字节")
-    print(f"压缩比: {compression_ratio:.2f}")
-    print(f"填充的字节数: {padding}")
-    
-    # 打印两组的原始和压缩后的二进制表示
-    print_binary(original_tensor[:bytes_per_group*2], 
-                 compressed_bits[:sum(len(compress_group(original_tensor[i:i+bytes_per_group], bits_per_unit)) 
-                                      for i in range(0, bytes_per_group*2, bytes_per_group))],
-                 bytes_per_group)
-    
-    print("------------------------")
 
-def main():
-    tensor_size = 10000  # 使用更大的张量以获得更稳定的结果
-    bits_per_unit_for_generation = 2  # 用于生成张量的 bits_per_unit
 
-    # 生成原始张量
-    original_tensor = generate_sparse_tensor(tensor_size, bits_per_unit_for_generation)
+# ===========================实验主体===========================
 
-    # 测试不同的参数组合
-    parameter_sets = [
-        (8, 2),  # 8字节分组，2位单位
-        (4, 1),  # 4字节分组，1位单位
-        (16, 4), # 16字节分组，4位单位
-        (8, 1),  # 8字节分组，1位单位
-        (8, 4),  # 8字节分组，4位单位
-        (8, 8),  # 8字节分组，8位单位
-    ]
+model = AutoModelForCausalLM.from_pretrained(
+    model_path,
+    torch_dtype=torch.float16,
+    device_map='cuda:0'
+)
+model.config.use_cache = True
 
-    for bytes_per_group, bits_per_unit in parameter_sets:
-        run_experiment(original_tensor, bytes_per_group, bits_per_unit)
+tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+tokenizer.pad_token = tokenizer.eos_token
+tokenizer.padding_side = "right"
 
-if __name__ == "__main__":
-    main()
+def process_new_kv_cache(new_key, new_value):
+    processed_new_key = quantize_activation_per_token_absmax(new_key)
+    processed_new_value = quantize_activation_per_token_absmax(new_value)
+    return processed_new_key, processed_new_value
+
+def kv_cache_hook(module, input, output):
+    global global_kv_cache_length
+    _, _, cache = output
+    key_cache = cache.key_cache
+    value_cache = cache.value_cache
+    
+    # 检查是否为列表结构
+    if isinstance(key_cache, list):
+        # 假设所有层的缓存长度相同，我们使用第一层的长度
+        current_length = key_cache[0].size(1)
+    else:
+        current_length = key_cache.size(1)
+    
+    new_tokens = current_length - global_kv_cache_length
+    
+    if new_tokens > 0:
+        if isinstance(key_cache, list):
+            for i in range(len(key_cache)):
+                # 获取新增的key和value
+                new_key = key_cache[i][:, global_kv_cache_length:, :]
+                new_value = value_cache[i][:, global_kv_cache_length:, :]
+                
+                processed_new_key, processed_new_value = process_new_kv_cache(new_key, new_value)
+                
+                # 更新缓存，只替换新增的部分
+                key_cache[i][:, global_kv_cache_length:, :] = processed_new_key
+                value_cache[i][:, global_kv_cache_length:, :] = processed_new_value
+        else:
+            # 获取新增的key和value
+            new_key = key_cache[:, global_kv_cache_length:, :]
+            new_value = value_cache[:, global_kv_cache_length:, :]
+            
+            processed_new_key, processed_new_value = process_new_kv_cache(new_key, new_value)
+            
+            # 更新缓存，只替换新增的部分
+            key_cache[:, global_kv_cache_length:, :] = processed_new_key
+            value_cache[:, global_kv_cache_length:, :] = processed_new_value
+        
+        # 更新全局历史长度
+        global_kv_cache_length = current_length
+    
+    return output
+
+def reset_kv_cache_length():
+    global global_kv_cache_length
+    global_kv_cache_length = 0
+
+# 注册hook
+for layer in model.model.layers:
+    layer.self_attn.register_forward_hook(kv_cache_hook)
+
+input_text = "Hello, how are you?"
+input_ids = tokenizer(input_text, return_tensors="pt").input_ids.to(model.device)
+
+with torch.no_grad():
+    output = model.generate(input_ids, max_length=10)
+    # 在开始新的推理任务时调用
+    reset_kv_cache_length()
+
+decoded_output = tokenizer.decode(output[0], skip_special_tokens=True)
+print("\nGenerated output:")
+print(decoded_output)
+print('compression_ratio: ', compression_ratio)
