@@ -1,24 +1,119 @@
 import torch
-import matplotlib.pyplot as plt
-import numpy as np
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
 # ===========================全局变量===========================
 compresser_type = 'Tree'
-bytes_per_group = 64
-bits_per_unit = 4
+bytes_per_group = 8
+bits_per_unit = 8
+ERR_TYPE = 1
+ERR_RATE = 1e-4
 # 全局变量来记录压缩比
 compression_ratio = 0
 
+global_kv_cache_length = 0
+
 model_path = "/media/tangshi/AI001/models/Llama-2-7b-hf"
+
+
+# ===========================错误注入===========================
+
+@torch.no_grad()
+def insert_err_without_ECC(org_bit, ERR_TYPE, ERR_RATE):
+    print(org_bit.dtype)
+    print(org_bit.shape)
+    
+    device = org_bit.device
+    input_shape = org_bit.shape
+    
+    # 生成与输入形状相同的随机概率矩阵，但在最后一个维度上增加8位
+    rand_probs = torch.rand(*input_shape, 8, device=device)
+    
+    # 生成错误掩码
+    error_mask = (rand_probs < ERR_RATE).to(torch.uint8)
+    
+    # 将 org_bit 展开为位级别的张量
+    org_bit_expanded = org_bit.unsqueeze(-1).bitwise_and(torch.tensor([1, 2, 4, 8, 16, 32, 64, 128], device=device))
+    org_bit_expanded = (org_bit_expanded != 0).to(torch.uint8)
+    
+    # 应用错误掩码
+    flipped_bits = org_bit_expanded ^ error_mask
+    
+    # 将结果压缩回 uint8
+    result = torch.sum(flipped_bits * torch.tensor([1, 2, 4, 8, 16, 32, 64, 128], device=device), dim=-1).to(torch.uint8)
+    
+    # 计算总错误数
+    total_errors = error_mask.sum().item()
+    
+    print(f"Total errors: {total_errors}")
+    print(f"Corrected errors: 0")  # 这个函数不进行纠错，所以纠正的错误数始终为0
+    
+    return result
+
+@torch.no_grad()
+def insert_err_with_ECC(org_bit, ERR_TYPE, ERR_RATE):
+    device = org_bit.device
+    N = org_bit.shape[0]
+    
+    # 确保输入大小是8的倍数
+    assert N % 8 == 0, "Input size must be a multiple of 8"
+    
+    # 将输入重塑为 (N//8, 8) 的形状
+    reshaped = org_bit.reshape(-1, 8)
+    
+    # 编码
+    encoded = hamming_encode_bytes(reshaped)
+    
+    # 注入错误
+    flip_mask = (torch.rand(encoded.shape, device=device) < ERR_RATE).bool()
+    encoded_with_errors = encoded ^ flip_mask.byte()
+    
+    # 解码并纠错
+    corrected, errors_corrected = hamming_decode_and_correct_bytes(encoded_with_errors)
+    
+    # 将结果重塑回原始形状
+    result = corrected.reshape(N)
+    
+    # 计算总错误数和纠正的错误数
+    total_errors = flip_mask.sum().item()
+    
+    print(f"Total errors: {total_errors}")
+    print(f"Corrected errors: {errors_corrected}")
+    
+    return result
+
+def hamming_encode_bytes(data):
+    device = data.device
+    encoded = torch.zeros((*data.shape[:-1], 9), dtype=torch.uint8, device=device)
+    encoded[..., :8] = data
+    
+    # 计算校验位
+    encoded[..., 8] = (
+        encoded[..., 0] ^ encoded[..., 1] ^ encoded[..., 3] ^ encoded[..., 4] ^ encoded[..., 6] ^
+        encoded[..., 2] ^ encoded[..., 3] ^ encoded[..., 5] ^ encoded[..., 6] ^
+        encoded[..., 4] ^ encoded[..., 5] ^ encoded[..., 6] ^ encoded[..., 7]
+    )
+    return encoded
+
+def hamming_decode_and_correct_bytes(encoded):
+    device = encoded.device
+    syndrome = (
+        (encoded[..., 0] ^ encoded[..., 1] ^ encoded[..., 3] ^ encoded[..., 4] ^ encoded[..., 6] ^ encoded[..., 8]) |
+        ((encoded[..., 2] ^ encoded[..., 3] ^ encoded[..., 5] ^ encoded[..., 6] ^ encoded[..., 8]) << 1) |
+        ((encoded[..., 4] ^ encoded[..., 5] ^ encoded[..., 6] ^ encoded[..., 7] ^ encoded[..., 8]) << 2)
+    )
+    error_pos = syndrome.unsqueeze(-1) == torch.arange(9, device=device)
+    corrected = encoded[..., :8].clone()
+    corrected[error_pos[..., :8]] ^= 1
+    return corrected, error_pos.sum().item()
+
 
 # ===========================树型压缩===========================
 
 @torch.no_grad()
-def Tree(org_tensor, bytes_per_group=64, bits_per_unit=4):
+def Tree(org_tensor, bytes_per_group, bits_per_unit):
     global compression_ratio
-    def tree_compress(org_tensor, bytes_per_group=64, bits_per_unit=4):
+    def tree_compress(org_tensor, bytes_per_group, bits_per_unit):
         device = org_tensor.device
         
         # Step 1: Flatten the tensor
@@ -51,7 +146,7 @@ def Tree(org_tensor, bytes_per_group=64, bits_per_unit=4):
         compressed_tensor = torch.tensor(compressed, dtype=torch.uint8, device=device)
         return compressed_tensor, pad_size
 
-    def tree_decompress(compressed_tensor, original_shape, bytes_per_group=64, bits_per_unit=4, pad_size=0):
+    def tree_decompress(compressed_tensor, original_shape, bytes_per_group, bits_per_unit, pad_size=0):
         device = compressed_tensor.device
         compressed = compressed_tensor.tolist()
         
@@ -88,6 +183,10 @@ def Tree(org_tensor, bytes_per_group=64, bits_per_unit=4):
         return decompressed_tensor
 
     compressed_tensor, pad_size = tree_compress(org_tensor, bytes_per_group=bytes_per_group, bits_per_unit=bits_per_unit)
+    global ERR_TYPE, ERR_RATE
+    # 注入错误（前2bit压缩后）
+    # compressed_tensor = insert_err_with_ECC(compressed_tensor,ERR_TYPE, ERR_RATE)
+    
     decompressed_tensor = tree_decompress(compressed_tensor, org_tensor.shape, bytes_per_group=bytes_per_group, bits_per_unit=bits_per_unit, pad_size=pad_size)
     
     # Calculate compression ratio
@@ -171,9 +270,12 @@ def compress(quantized_tensor):
     result_2bit, result_6bit = process_tensor(grouped_tensor)
     
     # 在这里选择不同的压缩、还原、错误注入
-    global compresser_type, bytes_per_group, bits_per_unit
+    global compresser_type, bytes_per_group, bits_per_unit, ERR_TYPE, ERR_RATE
     if compresser_type == 'Tree':
-        Tree(result_2bit, bytes_per_group=64, bits_per_unit=4)
+        Tree(result_2bit, bytes_per_group=bytes_per_group, bits_per_unit=bits_per_unit)
+        
+    # 注入错误（后6bit）
+    result_6bit = insert_err_without_ECC(result_6bit,ERR_TYPE, ERR_RATE)
     
     # 步骤3：恢复张量
     recovered_tensor = recover_tensor(result_2bit, result_6bit)
@@ -182,7 +284,7 @@ def compress(quantized_tensor):
     final_recovered_tensor = recovered_tensor.view(-1)[:-pad_size if pad_size > 0 else None].view(original_shape)
     
     # 断言检查恢复是否正确
-    assert torch.all(quantized_tensor == final_recovered_tensor), "Recovery failed"
+    # assert torch.all(quantized_tensor == final_recovered_tensor), "Recovery failed"
     
     return final_recovered_tensor
 
@@ -217,7 +319,7 @@ def exp(quantized_tensor):
     
     int16_shifted_tensor = uint8_to_int16(uint8_shifted_tensor_exp)
      
-    assert torch.all(shifted_tensor == int16_shifted_tensor), "压缩、解压错误"
+    # assert torch.all(shifted_tensor == int16_shifted_tensor), "压缩、解压错误"
         
     # 将数值偏移回原来的位置
     unshifted_tensor = (shifted_tensor + 96) % 256
@@ -320,34 +422,46 @@ tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
 tokenizer.pad_token = tokenizer.eos_token
 tokenizer.padding_side = "right"
 
-def process_kv_cache(key_cache, value_cache):
-    # 对 key_cache 进行量化
-    processed_key_cache = [quantize_activation_per_token_absmax(k) for k in key_cache]
-    
-    # 对 value_cache 进行量化
-    processed_value_cache = [quantize_activation_per_token_absmax(v) for v in value_cache]
-    return processed_key_cache, processed_value_cache
+def process_cache(cache):
+    processed_cache = quantize_activation_per_token_absmax(cache)
+    return processed_cache
 
-def kv_cache_hook(module, input, output):
-    _, _, cache = output
-    key_cache = cache.key_cache
-    value_cache = cache.value_cache
-    
-    processed_key_cache, processed_value_cache = process_kv_cache(key_cache, value_cache)
-    
-    cache.key_cache = processed_key_cache
-    cache.value_cache = processed_value_cache
-    
-    return output
+class CacheHook:
+    def __init__(self):
+        self.prev_key_cache_len = 0
+        self.prev_value_cache_len = 0
 
+    def k_cache_hook(self, module, input, output):
+        _, _, cache = output
+        if cache is not None and cache.key_cache is not None:
+            key_cache_len = len(cache.key_cache)
+            if key_cache_len > self.prev_key_cache_len:
+                cache.key_cache[-1] = process_cache(cache.key_cache[-1])
+            self.prev_key_cache_len = key_cache_len
+        return output
+
+    def v_cache_hook(self, module, input, output):
+        _, _, cache = output
+        if cache is not None and cache.value_cache is not None:
+            value_cache_len = len(cache.value_cache)
+            if value_cache_len > self.prev_value_cache_len:
+                cache.value_cache[-1] = process_cache(cache.value_cache[-1])
+            self.prev_value_cache_len = value_cache_len
+        return output
+
+# 注册钩子
+cache_hook = CacheHook()
 for layer in model.model.layers:
-    layer.self_attn.register_forward_hook(kv_cache_hook)
-
+    layer.self_attn.register_forward_hook(cache_hook.k_cache_hook)
+    layer.self_attn.register_forward_hook(cache_hook.v_cache_hook)
+    
+    
 input_text = "Hello, how are you?"
 input_ids = tokenizer(input_text, return_tensors="pt").input_ids.to(model.device)
 
 with torch.no_grad():
-    output = model.generate(input_ids, max_length=10)
+    output = model.generate(input_ids, max_length=100)
+
 
 decoded_output = tokenizer.decode(output[0], skip_special_tokens=True)
 print("\nGenerated output:")
