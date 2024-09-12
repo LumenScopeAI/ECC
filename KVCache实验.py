@@ -1,20 +1,211 @@
-import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
-
+import numpy as np
+import torch
+from pyldpc import make_ldpc, encode, get_message
 
 # ===========================全局变量===========================
-compresser_type = 'Tree'
-bytes_per_group = 8
+compresser_type = 'Sparse'
+bytes_per_group = 16
 bits_per_unit = 8
 ERR_TYPE = 1
 ERR_RATE = 1e-4
+code_rate = 0.5
 # 全局变量来记录压缩比
 compression_ratio = 0
 
-global_kv_cache_length = 0
+model_path = "/root/autodl-tmp/ECC_LLM/models/Qwen2-0.5B-Instruct"
 
-model_path = "/media/tangshi/AI001/models/Llama-2-7b-hf"
 
+# ===========================创新压缩===========================
+
+ 
+def to_bits(data):
+    dtype = data.dtype
+    if dtype != torch.uint8:
+        data = data.to(torch.uint8)
+    bits = torch.zeros(data.shape + (8,), dtype=torch.uint8, device=data.device)
+    for i in range(8):
+        bits[..., i] = (data >> i) & 1
+    return bits.flip(-1)
+
+def from_bits(bits):
+    bits = bits.flip(-1)
+    result = torch.zeros(bits.shape[:-1], dtype=torch.uint8, device=bits.device)
+    for i in range(8):
+        result |= bits[..., i].to(torch.uint8) << i
+    return result
+
+def Sparse_compress(input_data, A, B):
+    device = input_data.device
+    Q, W = input_data.shape
+    N = (A * 8) // B
+    
+    bit_tensor = to_bits(input_data).view(-1)
+    
+    total_bits = Q * W * 8
+    padding = (A * 8 - total_bits % (A * 8)) % (A * 8)
+    bit_tensor = torch.nn.functional.pad(bit_tensor, (0, padding))
+    
+    groups = bit_tensor.view(-1, A * 8)
+    
+    compressed_data = []
+    for group in groups:
+        units = group.view(-1, B)
+        flags = (units.sum(dim=1) != 0).to(torch.uint8)
+        non_zero_units = units[flags.bool()].view(-1)
+        
+        compressed_group = torch.cat([flags, non_zero_units])
+        compressed_data.append(compressed_group)
+        compressed_data.append(torch.ones(6, dtype=torch.uint8, device=device))  # Separator
+    
+    compressed_tensor = torch.cat(compressed_data)
+    
+    if len(compressed_tensor) % 8 != 0:
+        padding = 8 - (len(compressed_tensor) % 8)
+        compressed_tensor = torch.nn.functional.pad(compressed_tensor, (0, padding))
+    
+    return from_bits(compressed_tensor.view(-1, 8)), (Q, W)
+
+def error_recovery(compressed_data, ERR_TYPE, ERR_RATE):
+    print('error_recovery: ', compressed_data)
+    compressed_data = insert_err_with_ECC(compressed_data, ERR_TYPE, ERR_RATE)
+    return compressed_data
+
+def Sparse_decompress(compressed_data, A, B, original_shape):
+    device = compressed_data.device
+    Q, W = original_shape
+    N = (A * 8) // B
+    
+    bit_tensor = to_bits(compressed_data).view(-1)
+    
+    def normal_decompress():
+        decompressed_data = []
+        i = 0
+        while i < len(bit_tensor):
+            if i + 6 <= len(bit_tensor) and torch.all(bit_tensor[i:i+6] == 1):
+                i += 6  # Skip separator
+                continue
+            
+            if i + N > len(bit_tensor):
+                break  # End of data reached
+            
+            flags = bit_tensor[i:i+N].to(torch.bool)
+            i += N
+            
+            group = torch.zeros(A * 8, dtype=torch.uint8, device=device)
+            group_units = group.view(-1, B)
+            
+            non_zero_count = flags.sum().item()
+            if i + non_zero_count * B > len(bit_tensor):
+                break  # Incomplete group, stop decompression
+            
+            non_zero_data = bit_tensor[i:i + non_zero_count * B].view(-1, B)
+            i += non_zero_count * B
+            
+            group_units[flags] = non_zero_data
+            decompressed_data.append(group)
+        
+        if not decompressed_data:
+            return torch.zeros(original_shape, device=device, dtype=torch.uint8)
+        
+        decompressed_tensor = torch.cat(decompressed_data)
+        decompressed_tensor = decompressed_tensor[:Q*W*8]  # Remove padding
+        return from_bits(decompressed_tensor.view(-1, 8)).reshape(Q, W)
+
+    def error_recovery_decompress():
+        decompressed_data = []
+        i = 0
+        while i < len(bit_tensor):
+            # 错误恢复：检查分隔符
+            if i + 5 <= len(bit_tensor) and torch.sum(bit_tensor[i:i+5]) == 5:
+                if i + 6 > len(bit_tensor) or bit_tensor[i+5] == 0:
+                    if len(decompressed_data) > 0:
+                        if len(decompressed_data[-1]) % 2 == 1:
+                            decompressed_data[-1][-1] = 1
+                        else:
+                            bit_tensor[i+5] = 1
+                i += 6
+                continue
+            elif i + 6 <= len(bit_tensor) and torch.sum(bit_tensor[i:i+6]) == 5:
+                zero_index = torch.where(bit_tensor[i:i+6] == 0)[0][0]
+                bit_tensor[i+zero_index] = 1
+                i += 6
+                continue
+            
+            if i + N > len(bit_tensor):
+                break  # 数据结束
+            
+            flags = bit_tensor[i:i+N].to(torch.long)
+            i += N
+            
+            # 错误恢复：检查flags
+            k = (A * 8 - N) // B
+            t = flags.sum().item()
+            if t > k:
+                flags[:t-k] = 0
+            elif t < k:
+                flags[t:k] = 1
+            
+            group = torch.zeros(A * 8, dtype=torch.uint8, device=device)
+            non_zero_count = flags.sum().item()
+            
+            if i + non_zero_count * B > len(bit_tensor):
+                remaining_bits = len(bit_tensor) - i
+                non_zero_data = torch.nn.functional.pad(bit_tensor[i:], (0, non_zero_count * B - remaining_bits))
+                i = len(bit_tensor)
+            else:
+                non_zero_data = bit_tensor[i:i + non_zero_count * B]
+                i += non_zero_count * B
+            
+            group_units = group.view(-1, B)
+            group_units[flags.bool()] = non_zero_data.view(-1, B)
+            
+            decompressed_data.append(group)
+        
+        if not decompressed_data:
+            return torch.zeros(original_shape, device=device, dtype=torch.uint8)
+        
+        decompressed_tensor = torch.cat(decompressed_data)
+        if decompressed_tensor.size(0) < Q*W*8:
+            padding_size = Q*W*8 - decompressed_tensor.size(0)
+            decompressed_tensor = torch.cat([decompressed_tensor, torch.zeros(padding_size, dtype=torch.uint8, device=device)])
+        elif decompressed_tensor.size(0) > Q*W*8:
+            decompressed_tensor = decompressed_tensor[:Q*W*8]
+        
+        return from_bits(decompressed_tensor.view(-1, 8)).reshape(Q, W)
+
+    # 首先尝试正常解压
+    try:
+        result = normal_decompress()
+        if result.shape == original_shape:
+            return result
+    except Exception as e:
+        print(f"Normal decompression failed: {e}")
+
+    # 如果正常解压失败或结果形状不匹配，尝试错误恢复解压
+    print("Attempting error recovery decompression")
+    return error_recovery_decompress()
+    
+@torch.no_grad()
+def Sparse(org_tensor, bytes_per_group, bits_per_unit):
+    global compression_ratio, ERR_TYPE, ERR_TYPE
+
+    # 压缩
+    compressed, original_shape = Sparse_compress(org_tensor, bytes_per_group, bits_per_unit)
+    
+    # ECC处理
+    compressed_with_ecc = error_recovery(compressed, ERR_TYPE, ERR_RATE)
+    
+    # 解压缩
+    decompressed = Sparse_decompress(compressed_with_ecc, bytes_per_group, bits_per_unit, original_shape)
+    
+    # 计算压缩比并更新全局变量
+    compression_ratio = org_tensor.numel() / compressed.numel()
+    
+    # 检查是否无损
+    is_lossless = torch.all(org_tensor == decompressed)
+    
+    return compressed, decompressed, compression_ratio, is_lossless
 
 # ===========================错误注入===========================
 
@@ -52,14 +243,22 @@ def insert_err_without_ECC(org_bit, ERR_TYPE, ERR_RATE):
 
 @torch.no_grad()
 def insert_err_with_ECC(org_bit, ERR_TYPE, ERR_RATE):
+    print('org_bit: ', org_bit.shape)
     device = org_bit.device
     N = org_bit.shape[0]
+    original_shape = org_bit.shape  # 保存原始形状
     
-    # 确保输入大小是8的倍数
-    assert N % 8 == 0, "Input size must be a multiple of 8"
+    # 计算填充
+    padding = (64 - N % 64) % 64
     
-    # 将输入重塑为 (N//8, 8) 的形状
-    reshaped = org_bit.reshape(-1, 8)
+    # 如果需要，进行填充
+    if padding > 0:
+        padded_input = torch.cat([org_bit, torch.zeros(padding, dtype=torch.uint8, device=device)])
+    else:
+        padded_input = org_bit
+    
+    # 重塑为 (-1, 64)
+    reshaped = padded_input.reshape(-1, 64)
     
     # 编码
     encoded = hamming_encode_bytes(reshaped)
@@ -71,45 +270,48 @@ def insert_err_with_ECC(org_bit, ERR_TYPE, ERR_RATE):
     # 解码并纠错
     corrected, errors_corrected = hamming_decode_and_correct_bytes(encoded_with_errors)
     
-    # 将结果重塑回原始形状
-    result = corrected.reshape(N)
+    # 重塑回原始形状
+    result = corrected.reshape(-1)[:N].reshape(original_shape)
     
-    # 计算总错误数和纠正的错误数
+    # 计算总错误数
     total_errors = flip_mask.sum().item()
     
-    print(f"Total errors: {total_errors}")
-    print(f"Corrected errors: {errors_corrected}")
-    
+    print(f"总错误数: {total_errors}")
+    print(f"纠正的错误数: {errors_corrected}")
+    print('结果: ', result.shape)
     return result
 
 def hamming_encode_bytes(data):
     device = data.device
-    encoded = torch.zeros((*data.shape[:-1], 9), dtype=torch.uint8, device=device)
-    encoded[..., :8] = data
+    encoded = torch.zeros((*data.shape[:-1], 72), dtype=torch.uint8, device=device)
+    encoded[..., :64] = data
     
     # 计算校验位
-    encoded[..., 8] = (
-        encoded[..., 0] ^ encoded[..., 1] ^ encoded[..., 3] ^ encoded[..., 4] ^ encoded[..., 6] ^
-        encoded[..., 2] ^ encoded[..., 3] ^ encoded[..., 5] ^ encoded[..., 6] ^
-        encoded[..., 4] ^ encoded[..., 5] ^ encoded[..., 6] ^ encoded[..., 7]
-    )
+    for i in range(8):
+        encoded[..., 64+i] = encoded[..., i::8].sum(dim=-1) % 2
+    
     return encoded
 
 def hamming_decode_and_correct_bytes(encoded):
     device = encoded.device
-    syndrome = (
-        (encoded[..., 0] ^ encoded[..., 1] ^ encoded[..., 3] ^ encoded[..., 4] ^ encoded[..., 6] ^ encoded[..., 8]) |
-        ((encoded[..., 2] ^ encoded[..., 3] ^ encoded[..., 5] ^ encoded[..., 6] ^ encoded[..., 8]) << 1) |
-        ((encoded[..., 4] ^ encoded[..., 5] ^ encoded[..., 6] ^ encoded[..., 7] ^ encoded[..., 8]) << 2)
-    )
-    error_pos = syndrome.unsqueeze(-1) == torch.arange(9, device=device)
-    corrected = encoded[..., :8].clone()
-    corrected[error_pos[..., :8]] ^= 1
-    return corrected, error_pos.sum().item()
+    syndrome = torch.zeros((*encoded.shape[:-1], 8), dtype=torch.uint8, device=device)
+    
+    for i in range(8):
+        syndrome[..., i] = encoded[..., i::8].sum(dim=-1) % 2
+    
+    error_pos = (syndrome * torch.arange(1, 9, device=device)).sum(dim=-1) - 1
+    corrected = encoded[..., :64].clone()
+    
+    valid_errors = (error_pos >= 0) & (error_pos < 64)
+    corrected[valid_errors, error_pos[valid_errors]] ^= 1
+    
+    errors_corrected = valid_errors.sum().item()
+    
+    return corrected, errors_corrected
 
 
 # ===========================树型压缩===========================
-
+# 
 @torch.no_grad()
 def Tree(org_tensor, bytes_per_group, bits_per_unit):
     global compression_ratio
@@ -185,7 +387,8 @@ def Tree(org_tensor, bytes_per_group, bits_per_unit):
     compressed_tensor, pad_size = tree_compress(org_tensor, bytes_per_group=bytes_per_group, bits_per_unit=bits_per_unit)
     global ERR_TYPE, ERR_RATE
     # 注入错误（前2bit压缩后）
-    # compressed_tensor = insert_err_with_ECC(compressed_tensor,ERR_TYPE, ERR_RATE)
+    # print('compressed_tensor.shape: ',compressed_tensor.shape)
+    compressed_tensor = insert_err_with_ECC(compressed_tensor,ERR_TYPE, ERR_RATE)
     
     decompressed_tensor = tree_decompress(compressed_tensor, org_tensor.shape, bytes_per_group=bytes_per_group, bits_per_unit=bits_per_unit, pad_size=pad_size)
     
@@ -269,11 +472,14 @@ def compress(quantized_tensor):
     # 步骤2：处理张量
     result_2bit, result_6bit = process_tensor(grouped_tensor)
     
+    print('result_2bit: ', result_2bit.shape)
+    print('result_2bit: ', result_2bit.dtype)
     # 在这里选择不同的压缩、还原、错误注入
-    global compresser_type, bytes_per_group, bits_per_unit, ERR_TYPE, ERR_RATE
+    global compresser_type, bytes_per_group, bits_per_unit, ERR_TYPE, ERR_RATE, code_rate
     if compresser_type == 'Tree':
         Tree(result_2bit, bytes_per_group=bytes_per_group, bits_per_unit=bits_per_unit)
-        
+    elif compresser_type == 'Sparse':
+        Sparse(result_2bit, bytes_per_group=bytes_per_group, bits_per_unit=bits_per_unit)
     # 注入错误（后6bit）
     result_6bit = insert_err_without_ECC(result_6bit,ERR_TYPE, ERR_RATE)
     
